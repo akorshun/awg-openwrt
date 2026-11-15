@@ -1,0 +1,265 @@
+name: Build OpenWrt Snapshot (per kernel ABI)
+
+# Snapshot kmods are bound to the kernel ABI (apk pins them with
+# "kernel=<version>~<vermagic>-r<release>"), not to the snapshot revision.
+# The schedule only looks: a target is built when its current kernel ABI has
+# no package set yet, so new revisions with the same kernel cost nothing.
+#
+# Releases: one prerelease per kernel version, tag snapshot-linux-<version>.
+# Each target keeps only its newest ABI in that release; older assets of the
+# same target are removed once the new ones are uploaded.
+
+on:
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Snapshot targets, comma-separated; empty means all"
+        required: false
+        type: string
+      subtargets:
+        description: "Snapshot subtargets, comma-separated; empty means all"
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if the packages for this ABI are published"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-openwrt-snapshot-kernel
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      job-config: ${{ steps.config.outputs.job-config }}
+      count: ${{ steps.config.outputs.count }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Find targets with a new kernel ABI
+        id: config
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGETS: ${{ inputs.targets }}
+          SUBTARGETS: ${{ inputs.subtargets }}
+          FORCE: ${{ inputs.force }}
+        run: node snapshot-kernel-index.js "$TARGETS" "$SUBTARGETS" "$FORCE"
+
+  build:
+    name: "${{ matrix.build_env.target }}/${{ matrix.build_env.subtarget }} - ${{ matrix.build_env.abi }}"
+    runs-on: ubuntu-latest
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        build_env: ${{ fromJson(needs.discover.outputs.job-config) }}
+    env:
+      TARGET: ${{ matrix.build_env.target }}
+      SUBTARGET: ${{ matrix.build_env.subtarget }}
+      PKGARCH: ${{ matrix.build_env.pkgarch }}
+      ABI: ${{ matrix.build_env.abi }}
+      KERNEL_VERSION: ${{ matrix.build_env.kernelVersion }}
+      VERMAGIC: ${{ matrix.build_env.vermagic }}
+      REVISION: ${{ matrix.build_env.revision }}
+      RELEASE_TAG: ${{ matrix.build_env.releaseTag }}
+      ARTIFACT_POSTFIX: ${{ matrix.build_env.artifactPostfix }}
+      SDK_FILE: ${{ matrix.build_env.sdkFile }}
+      SDK_URL: ${{ matrix.build_env.sdkUrl }}
+      SDK_SHA256: ${{ matrix.build_env.sdkSha256 }}
+
+    steps:
+      - name: Checkout AWG source code
+        uses: actions/checkout@v7
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pyelftools zstd
+
+      - name: Download the Snapshot SDK
+        run: |
+          set -euo pipefail
+          wget -nv -O "$SDK_FILE" "$SDK_URL"
+          # The buildbot overwrites the SDK under the same name; a mismatch
+          # means a newer build landed since discovery. The next scheduled
+          # run picks it up.
+          echo "$SDK_SHA256  $SDK_FILE" | sha256sum -c - \
+            || { echo "::error::SDK changed on the server since discovery"; exit 1; }
+          case "$SDK_FILE" in
+            *.tar.zst) tar --zstd -xf "$SDK_FILE" ;;
+            *.tar.xz) tar -xf "$SDK_FILE" ;;
+          esac
+          rm "$SDK_FILE"
+          SDK_DIR=$(find . -maxdepth 1 -name "openwrt-sdk-*" -type d -print -quit)
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+
+          # An SDK has no .vermagic; the value is baked into include/kernel.mk.
+          ACTUAL=$(grep 'LINUX_VERMAGIC' "$SDK_DIR/include/kernel.mk" | grep -oE '[0-9a-f]{32}' | head -1) || true
+          echo "SDK vermagic: ${ACTUAL:-none} (expected $VERMAGIC)"
+          [ "$ACTUAL" = "$VERMAGIC" ] \
+            || { echo "::error::SDK vermagic $ACTUAL does not match $VERMAGIC"; exit 1; }
+
+      - name: Configure the SDK
+        run: |
+          set -euo pipefail
+          WORKSPACE_DIR=$(pwd)
+          cd "$SDK_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          cp -r "$WORKSPACE_DIR/kmod-amneziawg" package/
+          cp -r "$WORKSPACE_DIR/amneziawg-tools" package/
+          cp -r "$WORKSPACE_DIR/luci-proto-amneziawg" package/
+
+          {
+            echo "CONFIG_PACKAGE_kmod-amneziawg=m"
+            echo "CONFIG_PACKAGE_amneziawg-tools=y"
+            echo "CONFIG_PACKAGE_luci-proto-amneziawg=y"
+            echo "CONFIG_PACKAGE_luci-i18n-amneziawg-ru=y"
+          } > .config
+          make defconfig
+
+      - name: Build AmneziaWG packages
+        run: |
+          set -euo pipefail
+          cd "$SDK_DIR"
+          make -j"$(nproc)" \
+            package/kmod-amneziawg/compile \
+            package/amneziawg-tools/compile \
+            package/luci-proto-amneziawg/compile \
+            V=s
+
+      - name: Check and collect the packages
+        run: |
+          set -euo pipefail
+          APK="$SDK_DIR/staging_dir/host/bin/apk"
+          mkdir -p awgrelease
+          fail=0
+          for p in kmod-amneziawg amneziawg-tools luci-proto-amneziawg luci-i18n-amneziawg-ru; do
+            a=$(find "$SDK_DIR/bin" -type f -name "$p-[0-9]*.apk" -print -quit)
+            if [ -z "$a" ]; then
+              echo "::error::$p was not built"
+              fail=1
+              continue
+            fi
+            dump=$("$APK" adbdump "$a" 2>/dev/null) || true
+            arch=$(printf '%s\n' "$dump" | sed -n 's/^ *arch: *//p' | head -1)
+            echo "$(basename "$a"): arch ${arch:-?}"
+            if [ "$p" = kmod-amneziawg ]; then
+              dep=$(printf '%s\n' "$dump" | grep -oE 'kernel=[0-9.]+~[0-9a-f]{32}-r[0-9]+' | head -1) || true
+              echo "  depends on ${dep:-nothing}"
+              case "$dep" in
+                "kernel=$KERNEL_VERSION~$VERMAGIC-"*) ;;
+                *) echo "::error::kmod depends on '$dep', expected kernel $KERNEL_VERSION~$VERMAGIC"; fail=1 ;;
+              esac
+              [ "$arch" = "$PKGARCH" ] || { echo "::error::kmod arch $arch, expected $PKGARCH"; fail=1; }
+            fi
+            cp "$a" "awgrelease/${p}_${ARTIFACT_POSTFIX}.apk"
+          done
+          [ "$fail" -eq 0 ]
+
+          jq -n \
+            --arg tag "$RELEASE_TAG" --arg target "$TARGET" --arg subtarget "$SUBTARGET" \
+            --arg pkgarch "$PKGARCH" --arg abi "$ABI" --arg revision "$REVISION" \
+            '{tag:$tag,target:$target,subtarget:$subtarget,pkgarch:$pkgarch,abi:$abi,revision:$revision}' \
+            > "awgrelease/meta-${TARGET}-${SUBTARGET}.json"
+          ls -la awgrelease/
+
+      - name: Upload packages for publishing
+        uses: actions/upload-artifact@v4
+        with:
+          name: awg-${{ matrix.build_env.target }}-${{ matrix.build_env.subtarget }}
+          path: awgrelease/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish to snapshot-linux-* releases
+    runs-on: ubuntu-latest
+    needs: [discover, build]
+    if: always() && needs.discover.result == 'success' && needs.discover.outputs.count != '0'
+    steps:
+      - name: Download built packages
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: awg-*
+          path: built
+          merge-multiple: true
+
+      - name: Upload and prune old ABIs
+        if: steps.download.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          metas=(built/meta-*.json)
+          if [ "${#metas[@]}" -eq 0 ]; then
+            echo "Nothing was built."
+            exit 0
+          fi
+
+          for tag in $(jq -r .tag "${metas[@]}" | sort -u); do
+            kver=${tag#snapshot-linux-}
+            if ! gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+              notes=$(printf '%s\n' \
+                "AmneziaWG packages for OpenWrt SNAPSHOT images running Linux $kver." \
+                "" \
+                "A kmod only installs on the exact kernel ABI it was built for. Check yours with" \
+                "\`apk list --installed kernel\` (kernel-$kver~<vermagic>-r<N>) and pick the four" \
+                "files named <package>_$kver-<N>-<vermagic>_<pkgarch>_<target>_<subtarget>.apk," \
+                "then \`apk add --allow-untrusted ./*.apk\`." \
+                "" \
+                "Only the newest ABI of each target is kept here; update the image if yours is gone.")
+              gh release create "$tag" --repo "$REPO" --target "$GITHUB_SHA" \
+                --title "OpenWrt SNAPSHOT, Linux $kver" --notes "$notes" --prerelease
+            fi
+
+            files=()
+            for m in "${metas[@]}"; do
+              [ "$(jq -r .tag "$m")" = "$tag" ] || continue
+              abi=$(jq -r .abi "$m")
+              suffix="_$(jq -r .pkgarch "$m")_$(jq -r .target "$m")_$(jq -r .subtarget "$m").apk"
+              files+=(built/*"_${abi}${suffix}")
+            done
+            gh release upload "$tag" "${files[@]}" --repo "$REPO" --clobber
+
+            # Drop older ABIs of the targets that were just refreshed.
+            existing=$(gh release view "$tag" --repo "$REPO" --json assets --jq '.assets[].name')
+            for m in "${metas[@]}"; do
+              [ "$(jq -r .tag "$m")" = "$tag" ] || continue
+              abi=$(jq -r .abi "$m")
+              suffix="_$(jq -r .pkgarch "$m")_$(jq -r .target "$m")_$(jq -r .subtarget "$m").apk"
+              while IFS= read -r name; do
+                case "$name" in
+                  *"_${abi}${suffix}") ;;
+                  *"$suffix")
+                    echo "Removing $name"
+                    gh release delete-asset "$tag" "$name" --repo "$REPO" --yes ;;
+                esac
+              done <<< "$existing"
+            done
+          done
