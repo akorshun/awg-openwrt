@@ -100,8 +100,8 @@ jobs:
           set -euo pipefail
           wget -nv -O "$SDK_FILE" "$SDK_URL"
           # The buildbot overwrites the SDK under the same name; a mismatch
-          # means a newer build landed since discovery. The next scheduled
-          # run picks it up.
+          # means a newer build landed since discovery. Run the workflow
+          # again to pick it up.
           echo "$SDK_SHA256  $SDK_FILE" | sha256sum -c - \
             || { echo "::error::SDK changed on the server since discovery"; exit 1; }
           case "$SDK_FILE" in
