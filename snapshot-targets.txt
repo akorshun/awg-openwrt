@@ -1,0 +1,33 @@
+# OpenWrt Snapshot platforms built by build-snapshot-kernel.yml.
+# One target/subtarget per line; "#" starts a comment.
+# A manual run with explicit targets/subtargets ignores this list.
+
+# MediaTek / Ralink
+mediatek/filogic        # MT7981/MT7986/MT7988: Flint 2/4, AX3000T, RAX3000M, BPI-R3/R4
+mediatek/mt7622         # RT3200/E8450, BPI-R64
+ramips/mt7621           # Keenetic, Xiaomi 4A Gigabit, ER-X, Archer A6/C6
+ramips/mt76x8           # cheap MT7628/MT7688 routers
+
+# Qualcomm
+ath79/generic           # most Atheros/QCA MIPS routers
+ath79/nand
+ipq40xx/generic         # Mikrotik hAP ac2, GL.iNet B1300, Fritzbox 7530
+ipq806x/generic         # R7800, EA8500
+qualcommax/ipq807x      # AX3600/AX9000, RT-AX89X
+qualcommax/ipq60xx
+qualcommax/ipq50xx
+
+# Airoha
+airoha/an7581
+
+# ARM boards
+rockchip/armv8          # NanoPi R2S/R4S/R5S/R6S, R28S, MangoPi M28K
+bcm27xx/bcm2711         # Raspberry Pi 4
+bcm27xx/bcm2712         # Raspberry Pi 5
+sunxi/cortexa53         # Orange Pi, Radxa Cubie A5E
+mvebu/cortexa9          # WRT1900/3200ACM, Turris Omnia
+mvebu/cortexa72         # Espressobin Ultra, MOCHAbin
+armsr/armv8             # ARM VMs and SystemReady boards
+
+# x86
+x86/64

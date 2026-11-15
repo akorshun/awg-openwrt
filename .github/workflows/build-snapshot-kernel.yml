@@ -2,7 +2,7 @@ name: Build OpenWrt Snapshot (per kernel ABI)
 
 # Snapshot kmods are bound to the kernel ABI (apk pins them with
 # "kernel=<version>~<vermagic>-r<release>"), not to the snapshot revision.
-# The schedule only looks: a target is built when its current kernel ABI has
+# Platforms come from snapshot-targets.txt. The schedule only looks: a target is built when its current kernel ABI has
 # no package set yet, so new revisions with the same kernel cost nothing.
 #
 # Releases: one prerelease per kernel version, tag snapshot-linux-<version>.

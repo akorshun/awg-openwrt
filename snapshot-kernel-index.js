@@ -5,12 +5,17 @@
 // target/subtarget + <version>-<release>-<vermagic>. A new snapshot revision
 // that leaves the kernel ABI alone produces nothing to build.
 //
+// Platforms: snapshot-targets.txt, or the targets/subtargets given on the
+// command line (then every matching snapshot platform).
+//
 // Output (job-config): only the targets whose current ABI has no complete
 // package set in the snapshot-linux-<version> release yet.
 
 const axios = require('axios');
 const cheerio = require('cheerio');
 const core = require('@actions/core');
+const fs = require('fs');
+const path = require('path');
 
 const snapshotRoot = 'https://downloads.openwrt.org/snapshots/targets/';
 const tagPrefix = 'snapshot-linux-';
@@ -135,8 +140,18 @@ async function main() {
     throw new Error('Targets and subtargets must either both be set or both be empty');
   }
 
-  const targets = filterTargets.length > 0 ? filterTargets : await directoryNames(snapshotRoot);
   const pairs = [];
+  if (filterTargets.length === 0) {
+    // Default: the curated list, not every snapshot platform.
+    for (const line of fs.readFileSync(path.join(__dirname, 'snapshot-targets.txt'), 'utf8').split('\n')) {
+      const entry = line.replace(/#.*/, '').trim();
+      if (!entry) continue;
+      const [target, subtarget] = entry.split('/');
+      if (!target || !subtarget) throw new Error(`Bad line in snapshot-targets.txt: ${line}`);
+      pairs.push([target, subtarget]);
+    }
+  }
+  const targets = filterTargets;
   await Promise.all(targets.map(async target => {
     let subtargets;
     try {
